@@ -31,6 +31,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes"
 	cliflag "k8s.io/component-base/cli/flag"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -87,6 +88,12 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	fetcherImage := os.Getenv("FETCHER_IMAGE")
+	if fetcherImage == "" {
+		setupLog.Error(nil, "FETCHER_IMAGE is not set")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -178,11 +185,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	kubeClient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		setupLog.Error(err, "Failed to create Kubernetes client")
+		os.Exit(1)
+	}
+
 	// The availability controller registers VirtualMachineImportReconciler once
 	// the CRDs it watches (CDI DataVolumes) are present.
 	if err := mgr.Add(&controller.AvailabilityController{
 		Manager:         mgr,
 		DiscoveryClient: discoveryClient,
+		PodLogs:         controller.NewPodLogReader(kubeClient),
+		FetcherImage:    fetcherImage,
 	}); err != nil {
 		setupLog.Error(err, "Failed to add availability controller")
 		os.Exit(1)
