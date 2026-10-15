@@ -8,6 +8,10 @@ IMG_FETCHER ?= ${IMG_REGISTRY}/virt-import-fetcher:${VERSION}
 export CDI_VERSION ?= source
 export CDI_REPO ?= https://github.com/Acedus/containerized-data-importer
 export CDI_REF ?= defc3b3d6c7f19f02a72f4a1e378078fe8a2124b
+# Temporary: KubeVirt with the OCI export fixes the KubeVirt export tests need
+# (kubevirt/kubevirt#19058, #19064, #19066, #19082), from the export-dvt-by-name branch.
+export KUBEVIRT_REPO ?= https://github.com/0xFelix/kubevirt.git
+export KUBEVIRT_REF ?= 5867a097842eb98b478b0badb03dbd54d4a0cb91
 # VERSION defaults to 'latest', which is not a semantic version; the CSV needs one.
 CSV_VERSION ?= 0.0.0
 CSV_NAMESPACE ?= kubevirt
@@ -111,12 +115,13 @@ cluster-down: ## Stop the kubevirtci cluster running a stable version of KubeVir
 .PHONY: cluster-sync
 cluster-sync: generate ## Install virt-import to the kubevirtci cluster running a stable version of KubeVirt.
 	$(MAKE) container-build container-push IMG_REGISTRY=$$(./hack/kubevirtci.sh registry) IMG_PLATFORMS=linux/$(IMG_BUILD_ARCH) TLS_VERIFY=false
+	$(call push-functest-image,$$(./hack/kubevirtci.sh registry))
 	KUBECONFIG=$$(./hack/kubevirtci.sh kubeconfig) $(MAKE) undeploy uninstall install deploy IMG_REGISTRY=registry:5000 IGNORE_NOT_FOUND=true
 	KUBECONFIG=$$(./hack/kubevirtci.sh kubeconfig) hack/wait.sh
 
 .PHONY: cluster-functest
 cluster-functest: ## Run the functional tests on the kubevirtci cluster running a stable version of KubeVirt.
-	KUBECONFIG=$$(./hack/kubevirtci.sh kubeconfig) go test -v -timeout 0 ./tests/... -ginkgo.v -ginkgo.randomize-all $(FUNCTEST_EXTRA_ARGS)
+	KUBECONFIG=$$(./hack/kubevirtci.sh kubeconfig) go test -v -timeout 0 ./tests/... -ginkgo.v -ginkgo.randomize-all -push-registry=$$(./hack/kubevirtci.sh registry) $(FUNCTEST_EXTRA_ARGS)
 
 .PHONY: cluster-envtest-crds
 cluster-envtest-crds: ## Pull the third-party CRDs envtest needs from the kubevirtci cluster running a stable version of KubeVirt.
@@ -134,12 +139,13 @@ kubevirt-down: ## Stop the kubevirtci cluster running a git version of KubeVirt.
 .PHONY: kubevirt-sync
 kubevirt-sync: generate ## Install virt-import to the kubevirtci cluster running a git version of KubeVirt.
 	$(MAKE) container-build container-push IMG_REGISTRY=$$(./hack/kubevirt.sh registry) IMG_PLATFORMS=linux/$(IMG_BUILD_ARCH) TLS_VERIFY=false
+	$(call push-functest-image,$$(./hack/kubevirt.sh registry))
 	KUBECONFIG=$$(./hack/kubevirt.sh kubeconfig) $(MAKE) undeploy uninstall install deploy IMG_REGISTRY=registry:5000 IGNORE_NOT_FOUND=true
 	KUBECONFIG=$$(./hack/kubevirt.sh kubeconfig) hack/wait.sh
 
 .PHONY: kubevirt-functest
 kubevirt-functest: ## Run the functional tests on the kubevirtci cluster running a git version of KubeVirt.
-	KUBECONFIG=$$(./hack/kubevirt.sh kubeconfig) go test -v -timeout 0 ./tests/... -ginkgo.v -ginkgo.randomize-all $(FUNCTEST_EXTRA_ARGS)
+	KUBECONFIG=$$(./hack/kubevirt.sh kubeconfig) go test -v -timeout 0 ./tests/... -ginkgo.v -ginkgo.randomize-all -push-registry=$$(./hack/kubevirt.sh registry) $(FUNCTEST_EXTRA_ARGS)
 
 .PHONY: kubevirt-envtest-crds
 kubevirt-envtest-crds: ## Pull the third-party CRDs envtest needs from the kubevirtci cluster running a git version of KubeVirt.
@@ -166,6 +172,16 @@ container-build-controller: build-csv-manifests ## Build container image with th
 .PHONY: container-build-fetcher
 container-build-fetcher: ## Build container image with the fetcher.
 	$(call container-build-with-tool,$(CONTAINER_TOOL),$(IMG_FETCHER),fetcher.Dockerfile)
+
+# The image of the functional tests' helper Pods. It is only built for and pushed to the
+# kubevirtci registry $(1) by cluster-sync and kubevirt-sync, and never released.
+# Usage: $(call push-functest-image,<registry>)
+define push-functest-image
+	$(call container-build-with-tool,$(CONTAINER_TOOL),$(1)/virt-import-functest:latest,tests/image/Dockerfile)
+	$(if $(filter podman,$(CONTAINER_TOOL)),podman manifest push --tls-verify=false $(1)/virt-import-functest:latest $(1)/virt-import-functest:latest)
+endef
+
+cluster-sync kubevirt-sync: IMG_PLATFORMS = linux/$(IMG_BUILD_ARCH)
 
 IMG_BUILD_ARCH := $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 DOCKER_BUILDER ?= virt-import-docker-builder
