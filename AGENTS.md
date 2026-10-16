@@ -17,9 +17,10 @@ deliverable of [VEP #395](https://github.com/kubevirt/enhancements/pull/396).
 The target kind is auto-detected from the OCI manifest's `artifactType`. Disk data is not fetched by
 this controller: it is delegated to CDI via `DataVolumes`.
 
-**Current state: scaffolding.** The `VirtualMachineImport` API and the controller wiring exist;
-`Reconcile` is a no-op. The import state machine (metadata-fetch Job, DataVolume creation, config
-blob rewriting, target creation, finalizer GC) is not implemented yet.
+**Current state: Alpha.** The import pipeline (metadata-fetch Job, DataVolume creation, config blob
+rewriting, target creation, cleanup), functional tests including export/import round trips, and the
+`virtimportctl` CLI are implemented. It builds on unmerged CDI, KubeVirt and VEP changes; see
+"Temporary solutions" below before touching anything they affect.
 
 ## Architecture
 
@@ -46,8 +47,13 @@ run until they are created.
 ```
 api/core/v1alpha1/          VirtualMachineImport types (import.kubevirt.io/v1alpha1)
 cmd/main.go                 controller manager entrypoint
-cmd/fetcher/                metadata-fetch Job entrypoint (placeholder, no-op for now)
+cmd/fetcher/                metadata-fetch Job entrypoint, prints one {"fetchResult":...} line on stdout
+cmd/virtimportctl/          the virtimportctl CLI (create)
 internal/controller/        reconciler + CRD availability gating
+internal/artifact/          OCI artifact format (VEP #256): validation, platform selection, fetch result, config rewrite, fetcher flags and exit codes
+  artifacttest/             builds VEP #256 artifacts and the fixtures for tests
+internal/fetcher/           reads and validates artifact metadata with containers/image (go.podman.io/image/v5)
+internal/virtimportctl/     virtimportctl, built from virtctl's modules (see below)
 internal/scheme/            runtime scheme registration
 internal/apimachinery/      GetStableName, DNS-1035-safe deterministic child names
 internal/logs/              log level constants
@@ -59,16 +65,43 @@ tests/                      functional tests (need KUBECONFIG)
 
 virt-import imports `kubevirt.io/virt-template-api` for the `VirtualMachineTemplate` type, because a
 `VirtualMachineTemplate` is one of the two possible import targets. This is the one place where
-`template.kubevirt.io` legitimately appears in this repo - in `internal/scheme/scheme.go`, in the
+`template.kubevirt.io` legitimately appears in this repo - in `internal/artifact/rewrite.go`, in the
 RBAC marker on the reconciler, and in the admission policy. Do not "fix" those to
 `import.kubevirt.io`.
+
+### Temporary CDI API
+
+DataVolume layer selection (`spec.source.registry.layer`) comes from the unmerged
+[CDI #4301](https://github.com/kubevirt/containerized-data-importer/pull/4301). Until a CDI release
+contains it, `go.mod` replaces `kubevirt.io/containerized-data-importer-api` with that PR's commit on
+the author's fork, and the Makefile's `CDI_VERSION=source` default deploys CDI built from the same
+commit. Re-pin both together and refresh the envtest CRDs with `make cluster-envtest-crds` or
+`make kubevirt-envtest-crds`; once released, drop the `replace` and the CDI defaults and bump to
+the release tag.
+
+### virtimportctl
+
+`internal/virtimportctl` is laid out like virtctl in kubevirt/kubevirt (`pkg/virtctl`), so it can
+move into `virtctl vmimport` later. `clientconfig/`, `templates/` and `testing/` are copies of
+virtctl's modules and must stay in sync with them: change them only where virt-import needs to
+(import paths, names). `root.go` is virtctl's `root.go` with virt-import's names and commands.
+
+`kubevirt.io/client-go/kubecli` cannot be imported while it does not support Kubernetes 0.37, so
+`internal/virtimportctl/kubecli` holds copies of the few kubecli functions the virtctl modules use.
+Replace its imports with the real kubecli once it does, and delete it. `create` gets its import
+client through `GetImportClient`, like virtctl's `template create`.
 
 ## Controller Design
 
 ### VirtualMachineImport controller
 
-`internal/controller/virtualmachineimport_controller.go`. Watches `VirtualMachineImport` and owns the
-`DataVolumes` it creates (`Owns(&cdiv1beta1.DataVolume{})`). `Reconcile` is currently a no-op.
+`internal/controller/virtualmachineimport_controller.go`. Owns the metadata-fetch `Job`, the manifest
+`ConfigMap` and the `DataVolumes` it creates, and maps the fetch Pods back by label. See
+[internal/controller/AGENTS.md](internal/controller/AGENTS.md) for the pipeline and its invariants.
+
+The manager reads the fetcher image from the required `FETCHER_IMAGE` env var. The Makefile
+sets it through a local-config ConfigMap and a kustomize replacement in `config/manager`, since the
+images transformer only touches container images.
 
 ### CRD availability gating
 
@@ -79,23 +112,25 @@ virt-template's `vmtr_availability_controller.go`.
 the manager. CDI is an optional KubeVirt add-on, so the DataVolume watch cannot be registered
 unconditionally. `AvailabilityController` is a `manager.Runnable` that:
 
-1. polls discovery for everything in `requiredGroups` (currently just `cdi.kubevirt.io/v1beta1`),
+1. polls discovery for every resource in `requiredResources` (CDI `datavolumes` and `cdiconfigs`),
 2. calls `SetupWithManager` on the reconciler only once they are all present,
 3. meanwhile patches `Ready=False/Reason=Waiting` + `Progressing=True` onto pending
    `VirtualMachineImports`, so users see why nothing is happening instead of a crashlooping pod.
 
 `ExternalCRDCacheConfig(dc)` is its companion, consumed by `cmd/main.go` when building the manager.
-It label-scopes the DataVolume informer to `import.kubevirt.io/ImportUID` so the cache holds only
-DataVolumes this controller created, and puts `VirtualMachineTemplate` in `clientDisableFor` because
-it is a create-only target that must not start an informer for a possibly-absent CRD.
+It label-scopes the Job, Pod, ConfigMap and DataVolume informers to `import.kubevirt.io/ImportUID`
+so the cache holds only children this controller created, field-selects the single CDI `CDIConfig`
+named `config`. Targets are unstructured, which the client never caches,
+so the optional `template.kubevirt.io` group needs no cache entry. The CDIConfig informer is
+started by `startController` because nothing watches it.
 
-**If you add a second external watch**, extend `requiredGroups` and `ExternalCRDCacheConfig` - do not
+**If you add an external watch or read**, extend `requiredResources` and `ExternalCRDCacheConfig` - do not
 call `SetupWithManager` directly from `cmd/main.go`.
 
 ### Authorization
 
-There is no Go webhook. Spec immutability is a CRD CEL rule
-(`+kubebuilder:validation:XValidation:rule="self == oldSelf"`), and privilege-escalation is prevented
+There is no Go webhook. Spec immutability, a required registry source, its `docker://` URL and valid
+object names are CRD CEL rules (`+kubebuilder:validation:XValidation`), and privilege-escalation is prevented
 by a `ValidatingAdmissionPolicy` in `config/admission/`: creating a `VirtualMachineImport` requires
 that the user could create `DataVolumes`, `VirtualMachines` and `VirtualMachineTemplates` in the
 target namespace themselves. Both possible targets are checked up front, since the artifact has not
@@ -124,19 +159,20 @@ Service by DNS name.
 
 ### Prerequisites
 
-Go, podman or docker, kubectl. Build tools come from `tools/go.mod`, not your `$PATH`.
+Go, podman or docker, kubectl, and jq to pull the envtest CRDs (`make *-envtest-crds`). Build
+tools come from `tools/go.mod`, not your `$PATH`.
 
 ### Key make targets
 
 | Target | Purpose |
 |---|---|
 | `make all` | fmt, vet, vendor, lint, manifests, generate, check-uncommitted |
-| `make build` | build `bin/manager` and `bin/fetcher` |
+| `make build` | build `bin/manager`, `bin/fetcher` and `bin/virtimportctl` |
 | `make container-build` | controller and fetcher images (`container-build-controller`, `container-build-fetcher`) |
 | `make test` | unit + envtest suites |
 | `make manifests` | CRDs and RBAC via controller-gen |
 | `make generate` | deepcopy via controller-gen, clientset via `hack/generate.sh` |
-| `make vendor` | tidy all modules, `go work vendor`, vendor `tools/` |
+| `make vendor` | tidy all modules, `go work vendor`, full module graph checksums in `go.work.sum`, vendor `tools/` |
 | `make build-installer` | `dist/install.yaml` (standalone, cert-manager) |
 | `make build-csv-manifests` | `_out/manifests.yaml`, the CSV input baked into the image |
 | `make csv` | print the ClusterServiceVersion, as HCO gets it |
@@ -153,20 +189,43 @@ make cluster-functest  # functional tests against that cluster
 make cluster-down
 ```
 
-`kubevirt-up` / `-sync` / `-functest` / `-down` do the same against KubeVirt built from git.
+`make undeploy`, which `*-sync` runs first, deletes all imports while the controller still runs;
+otherwise their finalizers would block the deletion of the CRD.
 
-Both `up` paths install the CDI bundled with kubevirtci. Set `CDI_VERSION` to install a
-different one instead - useful while virt-import depends on CDI features that are merged but
-not yet in a kubevirtci release:
+`cluster-up` clones kubevirtci at the tag the latest KubeVirt release uses into `_cluster-up`. Only
+`cluster-up` clones, and it refuses a checkout of another tag; remove `_cluster-up` after
+`cluster-down` to move to a newer release.
+
+`kubevirt-up` / `-sync` / `-functest` / `-down` do the same against KubeVirt built from git:
+`KUBEVIRT_REF` (a branch, tag or commit) of `KUBEVIRT_REPO`, checked out into `_kubevirt`. Only
+`kubevirt-up` checks out; the other actions need an existing `_kubevirt` and use whatever it holds.
+`hack/cluster.sh` records the checked out ref in `.git/virt-import-ref` and never replaces or
+updates an existing checkout automatically, since a running cluster depends on it; remove
+`_kubevirt` after `kubevirt-down` to switch refs or pick up new commits of a branch. Both `up`
+paths enable the `OCIExport` feature gate for the functional tests importing KubeVirt exports.
+
+Rebuilding KubeVirt on a running cluster (`make cluster-sync` inside `_kubevirt`) deletes and
+recreates the `kubevirt` namespace, which removes virt-import, and resets the feature gates.
+Re-enable `OCIExport` and run `make kubevirt-sync` afterwards.
+
+Without `CDI_VERSION` both `up` paths install the CDI bundled with kubevirtci. Set it to install a
+different one instead - useful while virt-import depends on CDI features that are not yet in a
+kubevirtci release:
 
 ```
 CDI_VERSION=v1.65.0  make cluster-up   # a release tag, from the GitHub release assets
 CDI_VERSION=20260903 make cluster-up   # a nightly date, from the kubevirt-prow bucket
 CDI_VERSION=nightly  make cluster-up   # the most recent nightly
+CDI_VERSION=source   make cluster-up   # built from CDI_REPO at CDI_REF, pushed to the cluster registry
 ```
 
-`hack/cdi.sh` resolves the value to a manifest base URL (failing before cluster-up if it is
-unusable), turns off `KUBEVIRT_DEPLOY_CDI` so kubevirtci does not install a CDI we are about to
+**Temporary defaults.** The Makefile defaults to `CDI_VERSION=source` with `CDI_REPO`/`CDI_REF` on
+the CDI #4301 commit `go.mod` replaces the CDI API with, and to `KUBEVIRT_REPO`/`KUBEVIRT_REF` on a
+fork commit carrying the unmerged OCI export fixes the KubeVirt export tests need. Re-pin
+`CDI_REF` together with the `go.mod` replace; drop each default once its PRs are released.
+
+`hack/cdi.sh` resolves the value to a manifest base (failing before cluster-up if it is
+unusable; for `source` the manifests CDI's `make manifests` renders into `_out/cdi-src`), turns off `KUBEVIRT_DEPLOY_CDI` so kubevirtci does not install a CDI we are about to
 replace, applies `cdi-operator.yaml` and `cdi-cr.yaml`, and waits for the CDI CR. It also owns
 the `insecureRegistries: [registry:5000]` patch for both paths - KubeVirt's `cluster-deploy.sh`
 applies that patch only when it deploys CDI itself.
@@ -175,9 +234,11 @@ applies that patch only when it deploys CDI itself.
 
 Ginkgo v2 + Gomega throughout, `envtest` for controller suites.
 
-- Unit/envtest: `make test`. `config/crd/testing/` holds third-party CRDs (CDI `DataVolume`,
-  virt-template `VirtualMachineTemplate`) that envtest needs.
-- Functional: `make functest`, skipped when `KUBECONFIG` is unset.
+- Unit/envtest: `make test`. `config/crd/testing/` holds third-party CRDs (CDI `DataVolume` and
+  `CDIConfig`, virt-template `VirtualMachineTemplate`, KubeVirt `VirtualMachine`) that envtest needs.
+  `make cluster-envtest-crds` or `make kubevirt-envtest-crds` pulls them from a running cluster; do
+  not edit them by hand.
+- Functional: `make functest`, skipped when `KUBECONFIG` is unset. See [tests/AGENTS.md](tests/AGENTS.md).
 - `internal/controller/availability_controller_test.go` is the suite worth reading first: it starts an
   environment with the external CRDs deliberately absent and asserts the manager waits rather than
   crashes.
@@ -199,12 +260,31 @@ HCO runs the controller image with `--entrypoint=/csv-generator` (via the
 `cmd/csv-generator` reads `/data/manifests.yaml` - the `config/csv` render baked in by
 `make build-csv-manifests` - and hoists the Deployment into the install strategy and the RBAC into
 `clusterPermissions`/`permissions` per service account, with metadata from the embedded
-`csv-base.yaml`. operator-sdk is unused: it cannot be a `go tool` (containers/image needs cgo and
+`csv-base.yaml`. `--operator-image` sets the manager image; `--fetcher-image` overrides the
+manager's `FETCHER_IMAGE` baked in at build time (optional, so an HCO that does not pass it yet keeps
+working). Both images are listed in `relatedImages`. operator-sdk is unused: it cannot be a `go tool` (containers/image needs cgo and
 gpgme, `go tool` passes no build tags) and HCO discards the bundle scaffolding anyway.
 
 HCO keeps only the CSV and CRDs, and a CSV carries just Deployments and RBAC, so an HCO install gets
 no metrics Service, ServiceMonitor, NetworkPolicies or ValidatingAdmissionPolicy. Hence no metrics in
 the CSV: the manager leaves `--metrics-bind-address` at `0`, needing no cert and no cert-manager.
+
+## Temporary solutions
+
+Each item below works around something unmerged or unreleased. Resolve it when its trigger happens.
+
+| Item | Workaround | Trigger and action |
+|---|---|---|
+| CDI #4301 (layer selection) | `go.mod` `replace` of the CDI API to the PR commit, `CDI_VERSION=source` default deploys CDI built from it (see "Temporary CDI API") | CDI release: drop the `replace` and the CDI defaults, bump to the tag, refresh the envtest CRDs with `make cluster-envtest-crds`, name the minimum CDI version in README.md |
+| CDI in e2e | Makefile defaults `CDI_VERSION=source`, `CDI_REPO`/`CDI_REF` on the same commit as the `replace` | Nightly with #4301: `CDI_VERSION=nightly`; release: pin the tag and drop `CDI_REPO`/`CDI_REF` defaults |
+| KubeVirt export PRs #19058, #19064, #19066, #19082, #19485 | `kubevirt-*` lane builds `KUBEVIRT_REPO`/`KUBEVIRT_REF` from a fork commit combining them; round trips only pass on that lane | Merged: point the lane at upstream `main`. Released: drop the `KUBEVIRT_REPO`/`KUBEVIRT_REF` defaults, the round trips pass on the `cluster-*` lane too |
+| enhancements #464 (persistent state, relaxed validation) | Strict validation: every PVC volume needs a disk layer and every layer a volume, only `disk.raw+zstd` layers | Merged: allow PVC volumes without layer (left untouched), skip one persistent state layer, update the fixtures |
+| OCI constants | Copied from KubeVirt's unexported `pkg/storage/oci` into `internal/artifact/constants.go` | Exported upstream (e.g. in `kubevirt.io/api`): import them |
+| kubecli and Kubernetes 0.37 | `internal/virtimportctl/kubecli` stand-in, generated clientsets in `tests/` | kubecli supports 0.37: use it, delete the stand-in |
+| HCO (VEP Phase 3) | csv-generator `--fetcher-image` is optional | HCO passes it |
+
+The VEP itself still describes some behavior differently (DV/PVC naming, digest pinning, fetcher
+output contract, cleanup timing, DataVolumes owned by the target); the code is authoritative until the VEP is updated.
 
 ## Conventions
 
@@ -215,7 +295,10 @@ the CSV: the manager leaves `--metrics-bind-address` at `0`, needing no cert and
 - PRs and issues must follow the GitHub templates in `.github/`. Always read the template before
   creating a PR or issue and fill in all sections.
 - Container images: `quay.io/kubevirt/virt-import-controller` (`Dockerfile`) and
-  `quay.io/kubevirt/virt-import-fetcher` (`fetcher.Dockerfile`, runs in the metadata-fetch Job)
+  `quay.io/kubevirt/virt-import-fetcher` (`fetcher.Dockerfile`, runs in the metadata-fetch Job).
+  `tests/image/Dockerfile` builds `virt-import-functest`, the helper Pod image of the functional
+  tests; only `cluster-sync` / `kubevirt-sync` build it and push it to the kubevirtci registry, it
+  is never released or pushed elsewhere
 - Multi-arch: linux/amd64, linux/arm64, linux/s390x
 - Generated client code lives in `staging/`
 - Logging levels: `V(1)` for debug, `V(2)` for trace
