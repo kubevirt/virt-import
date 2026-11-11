@@ -146,6 +146,24 @@ See [AGENTS.md](AGENTS.md) for architecture, the module layout, and the reasonin
 repo differs from [kubevirt/virt-template](https://github.com/kubevirt/virt-template), which it was
 scaffolded from.
 
+### Dependency updates
+
+Renovate runs daily at 06:00 UTC and can also be started from the Actions tab. It proposes routine
+and security dependency updates on `main`; on `release-X.Y` branches, it proposes security updates
+only. It updates Go modules and GitHub Actions, including the pinned tools in `tools/go.mod`.
+
+Each Renovate branch runs `make vendor`, `make fmt`, `make generate`, and `make manifests` before its
+PR is created. The vendor pass refreshes `tools/vendor` before the generated code invokes a
+vendored Go tool.
+
+Renovate does not update the `go` directive in `go.work`. When a PR raises a module's minimum Go
+version, update `go.work` manually and check that the build and release environments support it.
+
+To enable the workflow, install the Renovate GitHub App on this repository with `contents:write`,
+`pull-requests:write`, `issues:write`, `workflows:write`, and `dependabot-alerts:read` permissions.
+Configure its ID and private key as the `RENOVATE_APP_ID` and `RENOVATE_APP_PRIVATE_KEY` Actions
+secrets.
+
 ## Community
 
 virt-import is part of the [KubeVirt](https://kubevirt.io) project, developed by SIG-compute.
