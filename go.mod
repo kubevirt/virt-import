@@ -6,12 +6,15 @@ require (
 	github.com/blang/semver/v4 v4.0.0
 	github.com/distribution/reference v0.6.0
 	github.com/go-logr/logr v1.4.4
+	github.com/google/go-containerregistry v0.21.6
 	github.com/klauspost/compress v1.19.1
 	github.com/onsi/ginkgo/v2 v2.33.0
 	github.com/onsi/gomega v1.43.1
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/operator-framework/api v0.45.0
+	github.com/spf13/cobra v1.10.2
+	github.com/spf13/pflag v1.0.10
 	go.podman.io/image/v5 v5.41.2
 	k8s.io/api v0.37.0
 	k8s.io/apimachinery v0.37.0
@@ -25,6 +28,7 @@ require (
 	kubevirt.io/virt-import-api v0.0.0-00010101000000-000000000000
 	kubevirt.io/virt-import-client-go v0.0.0-00010101000000-000000000000
 	kubevirt.io/virt-template-api v0.2.4
+	kubevirt.io/virt-template-client-go v0.2.4
 	sigs.k8s.io/cluster-api v1.14.3
 	sigs.k8s.io/controller-runtime v0.25.1
 	sigs.k8s.io/yaml v1.6.0
@@ -41,6 +45,7 @@ require (
 	github.com/containers/libtrust v0.0.0-20230121012942-c1716e8a8d01 // indirect
 	github.com/containers/ocicrypt v1.3.2 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/docker/cli v29.6.2+incompatible // indirect
 	github.com/docker/distribution v2.8.3+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.8 // indirect
 	github.com/docker/go-connections v0.8.1 // indirect
@@ -97,8 +102,6 @@ require (
 	github.com/prometheus/common v0.70.0 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
-	github.com/spf13/cobra v1.10.2 // indirect
-	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 // indirect
